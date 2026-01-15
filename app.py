@@ -10,7 +10,7 @@ from cotizador_core import (
 )
 
 st.set_page_config(page_title="Cotizador Welbe — Periódicos", layout="wide")
-st.title("Cotizador Welbe — Periódicos (Compuesta) — Diciembre 2026")
+st.title("Cotizador Welbe — 2026")
 
 @st.cache_data
 def _load_data():

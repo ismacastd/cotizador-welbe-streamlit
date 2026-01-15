@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import itertools
-import sys
 import unicodedata
 from pathlib import Path
 from typing import List, Tuple, Dict
@@ -25,6 +24,12 @@ FACTOR_FB_NOVOL = 2.20
 
 MAIN_LAB = "CHOPO"
 FACTOR_ZONA2 = 1.8  # Candidatos fallback: CHOPO × 1.8
+
+# ✅ Etiqueta visible cuando el precio viene por fallback (base CHOPO × factor)
+LAB_FALLBACK_LABEL = "AGREGAR RED"
+
+# ✅ Columna amigable para usuario final (solo se llena cuando aplica fallback por batería incompleta)
+OBS_COL = "Observación"
 
 # ───────── Utilidades ─────────
 def _clean(txt: str) -> str:
@@ -116,6 +121,50 @@ def _comb_dos_labs(df_est_req: pd.DataFrame, df_suc_sub: pd.DataFrame, est_norm:
         if ok:
             return lab1, lab2
     return ()
+
+def _observacion_bateria_incompleta(df_here: pd.DataFrame, df_est_req: pd.DataFrame, est_norm: set,
+                                   studies_original: List[str], edo: str, ciu: str) -> str:
+    """
+    Devuelve un texto amigable para usuario final del tipo:
+      "Mastografía no disponible en ningún laboratorio del municipio"
+    Si no puede determinarlo, regresa un mensaje genérico.
+    """
+    labs = sorted(df_here["Laboratorio"].unique().tolist())
+    if not labs:
+        return "Sin cobertura en el municipio"
+
+    faltantes_globales: List[str] = []
+
+    # Para cada estudio: si NINGÚN lab (con alguna sucursal del municipio) lo puede cubrir, lo marcamos como faltante global.
+    for est_name in studies_original:
+        estn = _clean(est_name)
+        disponible_en_alguno = False
+
+        for lab in labs:
+            df_lab_suc = df_here[df_here["Laboratorio"] == lab]
+            if df_lab_suc.empty:
+                continue
+
+            # Debe existir el estudio en el catálogo de estudios para ese lab
+            r = df_est_req[(df_est_req["Laboratorio"] == lab) & (df_est_req["Estudio_norm"] == estn)]
+            if r.empty:
+                continue
+
+            # Y su categoría debe estar cubierta por AL MENOS una sucursal de ese lab en el municipio
+            cat = r["Categoria_lab"].iloc[0]
+            if _cat_ok_exact(cat, df_lab_suc["Cats_set"]):
+                disponible_en_alguno = True
+                break
+
+        if not disponible_en_alguno:
+            faltantes_globales.append(est_name)
+
+    if not faltantes_globales:
+        return "No hay laboratorio con batería completa en el municipio"
+
+    # Para UX: mostrar solo el “principal”. Si quieres mostrar todos, se puede.
+    principal = faltantes_globales[0]
+    return f"{principal} no disponible en ningún laboratorio del municipio"
 
 # ───────── COTIZACIÓN SENCILLA (Candidatos) ─────────
 def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
@@ -243,34 +292,46 @@ def cotizar_compuesto(studies: List[str],
         df_here = df_suc[df_suc.CP.isin(cps)]
         df_est_req = df_est[df_est.Estudio_norm.isin(est_norm)]
 
-        # Sin sucursales → todo fallback
+        # 0) Sin sucursales → todo fallback (AGREGAR RED)
         if df_here.empty:
             for s in studies:
                 estn = _clean(s)
                 if estn not in chopo_map or pd.isna(chopo_map[estn]):
+                    fallback_rows.append({
+                        "Estado": edo, "Municipio": ciu,
+                        "Laboratorio": LAB_FALLBACK_LABEL,
+                        "Sucursal": "SIN SUCURSALES",
+                        "Estudio": s,
+                        OBS_COL: "Sin sucursales en el municipio",
+                        "Motivo": "Sin costo base para fallback"
+                    })
                     continue
+
                 costo = float(chopo_map[estn]) * factor_global
                 precio = round(costo / (1.0 - margin), 2)
+
                 rows_detalle.append({
                     "Estado": edo, "Municipio": ciu,
-                    "Laboratorio": MAIN_LAB,
+                    "Laboratorio": LAB_FALLBACK_LABEL,
                     "Sucursal": "SIN SUCURSALES",
                     "Estudio": s,
                     "Costo_lab": round(costo, 2),
                     "Precio_lab": precio,
                     "Margen": margin,
                     "Fallback": True,
+                    OBS_COL: "Sin sucursales en el municipio",
                 })
                 fallback_rows.append({
                     "Estado": edo, "Municipio": ciu,
-                    "Laboratorio": MAIN_LAB,
+                    "Laboratorio": LAB_FALLBACK_LABEL,
                     "Sucursal": "SIN SUCURSALES",
                     "Estudio": s,
+                    OBS_COL: "Sin sucursales en el municipio",
                     "Motivo": "Sin sucursales en municipio"
                 })
             continue
 
-        # 1) labs que cubran batería completa
+        # 1) labs que cubran batería completa (por lab + sucursal)
         labs_full: List[Tuple[str, str]] = []
         for lab in sorted(df_here.Laboratorio.unique()):
             df_lab_suc = df_here[df_here.Laboratorio == lab]
@@ -287,21 +348,49 @@ def cotizar_compuesto(studies: List[str],
                     labs_full.append((lab, suc_row.Sucursal))
                     break
 
-        if labs_full:
-            labs_to_show = labs_full
-        else:
-            labs_to_show = []
-            for lab in sorted(df_here.Laboratorio.unique()):
-                sucursal = df_here[df_here.Laboratorio == lab].iloc[0].Sucursal
-                labs_to_show.append((lab, sucursal))
-            fallback_rows.append({
-                "Estado": edo, "Municipio": ciu,
-                "Laboratorio": "", "Sucursal": "", "Estudio": "",
-                "Motivo": "Ningún laboratorio cubre la batería completa"
-            })
+        # ✅ Si NO hay batería completa: NO mostramos labs parciales.
+        #    Solo mostramos fallback etiquetado como "AGREGAR RED"
+        if not labs_full:
+            obs_txt = _observacion_bateria_incompleta(df_here, df_est_req, est_norm, studies, edo, ciu)
+            for s in studies:
+                estn = _clean(s)
+                if estn not in chopo_map or pd.isna(chopo_map[estn]):
+                    fallback_rows.append({
+                        "Estado": edo, "Municipio": ciu,
+                        "Laboratorio": LAB_FALLBACK_LABEL,
+                        "Sucursal": "SIN SUCURSAL CON BATERÍA COMPLETA",
+                        "Estudio": s,
+                        OBS_COL: obs_txt,
+                        "Motivo": "Sin costo base para fallback"
+                    })
+                    continue
 
-        # 2) cotizar por lab/sucursal
-        for lab, sucursal in labs_to_show:
+                costo = float(chopo_map[estn]) * factor_global
+                precio = round(costo / (1.0 - margin), 2)
+
+                rows_detalle.append({
+                    "Estado": edo, "Municipio": ciu,
+                    "Laboratorio": LAB_FALLBACK_LABEL,
+                    "Sucursal": "SIN SUCURSAL CON BATERÍA COMPLETA",
+                    "Estudio": s,
+                    "Costo_lab": round(costo, 2),
+                    "Precio_lab": precio,
+                    "Margen": margin,
+                    "Fallback": True,
+                    OBS_COL: obs_txt,
+                })
+                fallback_rows.append({
+                    "Estado": edo, "Municipio": ciu,
+                    "Laboratorio": LAB_FALLBACK_LABEL,
+                    "Sucursal": "SIN SUCURSAL CON BATERÍA COMPLETA",
+                    "Estudio": s,
+                    OBS_COL: obs_txt,
+                    "Motivo": "Ningún laboratorio cubre batería completa → fallback"
+                })
+            continue
+
+        # 2) cotizar SOLO labs con batería completa
+        for lab, sucursal in labs_full:
             df_suc_lab_suc = df_here[(df_here.Laboratorio == lab) & (df_here.Sucursal == sucursal)]
             suc_cats = df_suc_lab_suc["Cats_set"].iloc[0] if not df_suc_lab_suc.empty else set()
 
@@ -319,6 +408,8 @@ def cotizar_compuesto(studies: List[str],
                         except Exception:
                             costo = None
 
+                # Si por un dato raro faltara costo, permitimos fallback,
+                # pero lo etiquetamos como "AGREGAR RED" (no como el lab original).
                 if costo is None and estn in chopo_map and pd.notna(chopo_map[estn]):
                     costo = float(chopo_map[estn]) * factor_global
                     fallback_flag = True
@@ -327,25 +418,33 @@ def cotizar_compuesto(studies: List[str],
                     fallback_rows.append({
                         "Estado": edo, "Municipio": ciu,
                         "Laboratorio": lab, "Sucursal": sucursal,
-                        "Estudio": s, "Motivo": "Sin costo disponible"
+                        "Estudio": s,
+                        OBS_COL: "",
+                        "Motivo": "Sin costo disponible"
                     })
                     continue
 
                 precio = round(costo / (1.0 - margin), 2)
                 rows_detalle.append({
                     "Estado": edo, "Municipio": ciu,
-                    "Laboratorio": lab, "Sucursal": sucursal,
+                    "Laboratorio": (LAB_FALLBACK_LABEL if fallback_flag else lab),
+                    "Sucursal": sucursal,
                     "Estudio": s,
                     "Costo_lab": round(costo, 2),
                     "Precio_lab": precio,
                     "Margen": margin,
                     "Fallback": fallback_flag,
+                    OBS_COL: (f"{s} cotizado por fallback" if fallback_flag else ""),
                 })
+
                 if fallback_flag:
                     fallback_rows.append({
                         "Estado": edo, "Municipio": ciu,
-                        "Laboratorio": lab, "Sucursal": sucursal,
-                        "Estudio": s, "Motivo": "Fallback CHOPO × factor"
+                        "Laboratorio": LAB_FALLBACK_LABEL,
+                        "Sucursal": sucursal,
+                        "Estudio": s,
+                        OBS_COL: f"{s} cotizado por fallback",
+                        "Motivo": "Fallback (base CHOPO × factor)"
                     })
 
     return pd.DataFrame(rows_detalle), pd.DataFrame(fallback_rows)
