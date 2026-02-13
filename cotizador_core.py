@@ -1,5 +1,11 @@
-# cotizador_core.py  – Welbe v3.1 (core para Streamlit)
-# Basado en tu cotizador_welbe.py (misma lógica, sin Tkinter)
+# cotizador_core.py  – Welbe v3.1.1 (core para Streamlit)
+# ✅ Mantiene tu lógica de categorías/batería/fallback intacta
+# ✅ Mantiene zfill(5) en CP (NO se cambia)
+# ✅ Nuevo: entrada a sucursales por capas usando (Estado, Municipio):
+#    1) CP vía SEPOMEX (igual que antes)
+#    2) Si falla: Estado+Ciudad == Municipio
+#    3) Si falla: Estado+Delegacion == Municipio
+#    4) Si falla: match "contiene" (suave) dentro del Estado
 
 from __future__ import annotations
 
@@ -39,6 +45,7 @@ def _clean(txt: str) -> str:
             .strip().upper())
 
 def _fix_cp(s: pd.Series) -> pd.Series:
+    # ✅ Mantener zfill(5) como definiste
     return (s.astype(str).str.replace(r"\.0$", "", regex=True)
                    .str.strip().str.zfill(5))
 
@@ -59,16 +66,34 @@ def load_estudios() -> pd.DataFrame:
     return df.dropna(subset=["Estudio"])
 
 def load_sucursales() -> pd.DataFrame:
+    """
+    Ahora cargamos Ciudad/Estado/Delegacion además de CP para permitir match alternativo
+    cuando CP (SEPOMEX) no encuentre sucursales.
+    """
     df = _read_xl(FILE_CHOPO, "Sucursales")
     df.columns = df.columns.str.upper().str.strip()
-    df = df[["UNIDAD", "CODIGO POSTAL", "CATEGORIAS", "LABORATORIO"]]
-    df.columns = ["Sucursal", "CP", "Categorias", "Laboratorio"]
+
+    # Encabezados según tu captura:
+    # ... CODIGO POSTAL, DELEGACION, CIUDAD, ESTADO, CATEGORIAS, LABORATORIO, UNIDAD ...
+    needed = ["UNIDAD", "CODIGO POSTAL", "CATEGORIAS", "LABORATORIO", "DELEGACION", "CIUDAD", "ESTADO"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Faltan columnas en hoja 'Sucursales': {missing}")
+
+    df = df[needed]
+    df.columns = ["Sucursal", "CP", "Categorias", "Laboratorio", "Delegacion", "Ciudad", "Estado"]
+
     df["CP"]          = _fix_cp(df["CP"])
     df["Laboratorio"] = df["Laboratorio"].apply(_clean)
-    df["Cats_set"]    = df["Categorias"].fillna("").apply(
+    df["Delegacion"]  = df["Delegacion"].apply(_clean)
+    df["Ciudad"]      = df["Ciudad"].apply(_clean)
+    df["Estado"]      = df["Estado"].apply(_clean)
+
+    df["Cats_set"] = df["Categorias"].fillna("").apply(
         lambda s: {_clean(c) for c in str(s).split(",") if str(c).strip()}
     )
-    return df.dropna(subset=["CP"])
+
+    return df.dropna(subset=["Sucursal"])
 
 def load_catalogo_cp() -> pd.DataFrame:
     if not FILE_CP.exists():
@@ -76,17 +101,64 @@ def load_catalogo_cp() -> pd.DataFrame:
     df = pd.read_csv(FILE_CP, dtype=str, encoding="latin1")
     df.columns = df.columns.str.lower().str.strip()
     cp_col = next(c for c in ("d_codigo", "d_cp", "c_cp", "cp") if c in df.columns)
+
     df = df[[cp_col, "d_estado", "d_mnpio"]]
-    df.columns = ["CP", "estado", "ciudad"]
-    df["CP"]     = _fix_cp(df["CP"])
-    df["estado"] = df["estado"].apply(_clean)
-    df["ciudad"] = df["ciudad"].apply(_clean)
-    return df.dropna(subset=["CP", "ciudad"])
+    df.columns = ["CP", "estado", "municipio"]
+
+    df["CP"]        = _fix_cp(df["CP"])
+    df["estado"]    = df["estado"].apply(_clean)
+    df["municipio"] = df["municipio"].apply(_clean)
+
+    return df.dropna(subset=["CP", "municipio"])
+
+# ───────── Entrada a sucursales por municipio (capas) ─────────
+def cps_municipio(df_cp: pd.DataFrame, edo: str, mun: str) -> List[str]:
+    return df_cp.query("estado == @edo and municipio == @mun", engine="python")["CP"].tolist()
+
+def _contains_either(a: str, b: str) -> bool:
+    # "fuzzy suave": A contiene B o B contiene A, ya limpios
+    if not a or not b:
+        return False
+    return (a in b) or (b in a)
+
+def sucursales_para_municipio(df_suc: pd.DataFrame, df_cp: pd.DataFrame, edo: str, mun: str) -> pd.DataFrame:
+    """
+    Dado (Estado, Municipio) ya normalizados, regresa sucursales candidatas en este orden:
+      1) Match por CP (SEPOMEX municipio -> lista CP -> sucursales CP IN lista)
+      2) Match por Estado + Ciudad == Municipio
+      3) Match por Estado + Delegacion == Municipio
+      4) Match por Estado + (Ciudad contiene Municipio o viceversa) OR (Delegacion contiene Municipio o viceversa)
+    """
+    # 1) CP exacto (como antes)
+    cps = cps_municipio(df_cp, edo, mun)
+    if cps:
+        df_cp_match = df_suc[df_suc["CP"].isin(cps)]
+        if not df_cp_match.empty:
+            return df_cp_match
+
+    # 2) Ciudad exacta
+    df_city = df_suc[(df_suc["Estado"] == edo) & (df_suc["Ciudad"] == mun)]
+    if not df_city.empty:
+        return df_city
+
+    # 3) Delegación exacta
+    df_del = df_suc[(df_suc["Estado"] == edo) & (df_suc["Delegacion"] == mun)]
+    if not df_del.empty:
+        return df_del
+
+    # 4) Contiene (suave) dentro del Estado
+    df_state = df_suc[df_suc["Estado"] == edo].copy()
+    if df_state.empty:
+        return df_state
+
+    mask = df_state.apply(
+        lambda r: _contains_either(r.get("Ciudad", ""), mun) or _contains_either(r.get("Delegacion", ""), mun),
+        axis=1
+    )
+    df_fuzzy = df_state[mask]
+    return df_fuzzy
 
 # ───────── Cobertura helpers ─────────
-def cps_municipio(df_cp: pd.DataFrame, edo: str, ciu: str) -> List[str]:
-    return df_cp.query("estado == @edo and ciudad == @ciu", engine="python")["CP"].tolist()
-
 def _cat_ok_exact(cat: str, cats_series: pd.Series) -> bool:
     return any(cat == c for s in cats_series for c in s)
 
@@ -123,19 +195,12 @@ def _comb_dos_labs(df_est_req: pd.DataFrame, df_suc_sub: pd.DataFrame, est_norm:
     return ()
 
 def _observacion_bateria_incompleta(df_here: pd.DataFrame, df_est_req: pd.DataFrame, est_norm: set,
-                                   studies_original: List[str], edo: str, ciu: str) -> str:
-    """
-    Devuelve un texto amigable para usuario final del tipo:
-      "Mastografía no disponible en ningún laboratorio del municipio"
-    Si no puede determinarlo, regresa un mensaje genérico.
-    """
+                                   studies_original: List[str], edo: str, mun: str) -> str:
     labs = sorted(df_here["Laboratorio"].unique().tolist())
     if not labs:
         return "Sin cobertura en el municipio"
 
     faltantes_globales: List[str] = []
-
-    # Para cada estudio: si NINGÚN lab (con alguna sucursal del municipio) lo puede cubrir, lo marcamos como faltante global.
     for est_name in studies_original:
         estn = _clean(est_name)
         disponible_en_alguno = False
@@ -145,12 +210,10 @@ def _observacion_bateria_incompleta(df_here: pd.DataFrame, df_est_req: pd.DataFr
             if df_lab_suc.empty:
                 continue
 
-            # Debe existir el estudio en el catálogo de estudios para ese lab
             r = df_est_req[(df_est_req["Laboratorio"] == lab) & (df_est_req["Estudio_norm"] == estn)]
             if r.empty:
                 continue
 
-            # Y su categoría debe estar cubierta por AL MENOS una sucursal de ese lab en el municipio
             cat = r["Categoria_lab"].iloc[0]
             if _cat_ok_exact(cat, df_lab_suc["Cats_set"]):
                 disponible_en_alguno = True
@@ -162,9 +225,7 @@ def _observacion_bateria_incompleta(df_here: pd.DataFrame, df_est_req: pd.DataFr
     if not faltantes_globales:
         return "No hay laboratorio con batería completa en el municipio"
 
-    # Para UX: mostrar solo el “principal”. Si quieres mostrar todos, se puede.
-    principal = faltantes_globales[0]
-    return f"{principal} no disponible en ningún laboratorio del municipio"
+    return f"{faltantes_globales[0]} no disponible en ningún laboratorio del municipio"
 
 # ───────── COTIZACIÓN SENCILLA (Candidatos) ─────────
 def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
@@ -184,21 +245,22 @@ def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
 
     filas: List[Dict] = []
 
-    for edo, ciu in sel_ciu:
-        edo_c, ciu_c = _clean(edo), _clean(ciu)
-        cps = cps_municipio(df_cp, edo_c, ciu_c)
-        df_here = df_suc[df_suc.CP.isin(cps)]
+    for edo, mun in sel_ciu:
+        edo_c, mun_c = _clean(edo), _clean(mun)
+
+        # ✅ NUEVO: entrada por capas (CP -> Ciudad -> Delegación -> contiene)
+        df_here = sucursales_para_municipio(df_suc, df_cp, edo_c, mun_c)
 
         # Caso 1: sin sucursales → fallback directo CHOPO × 1.8
         if df_here.empty:
             for est_name in sel_est:
                 estn = _clean(est_name)
                 if estn not in chopo_map or pd.isna(chopo_map[estn]):
-                    raise ValueError(f"No se encontró costo CHOPO para '{est_name}' en {ciu}, {edo}.")
+                    raise ValueError(f"No se encontró costo CHOPO para '{est_name}' en {mun}, {edo}.")
                 costo = float(chopo_map[estn]) * FACTOR_ZONA2
                 precio = round(costo / (1.0 - margin), 2)
                 filas.append({
-                    "Estado": edo, "Ciudad": ciu,
+                    "Estado": edo, "Ciudad": mun,
                     "Sucursal": "SIN SUCURSALES",
                     "Estudio": est_name,
                     "Costo": round(costo, 2),
@@ -236,7 +298,7 @@ def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
                     costo = float(r.Costo.iloc[0])
                     precio = round(costo / (1.0 - margin), 2)
                     filas.append({
-                        "Estado": edo, "Ciudad": ciu,
+                        "Estado": edo, "Ciudad": mun,
                         "Sucursal": sucursal,
                         "Estudio": est_name,
                         "Costo": round(costo, 2),
@@ -249,11 +311,11 @@ def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
             for est_name in sel_est:
                 estn = _clean(est_name)
                 if estn not in chopo_map or pd.isna(chopo_map[estn]):
-                    raise ValueError(f"No se encontró costo CHOPO para '{est_name}' en {ciu}, {edo}.")
+                    raise ValueError(f"No se encontró costo CHOPO para '{est_name}' en {mun}, {edo}.")
                 costo = float(chopo_map[estn]) * FACTOR_ZONA2
                 precio = round(costo / (1.0 - margin), 2)
                 filas.append({
-                    "Estado": edo, "Ciudad": ciu,
+                    "Estado": edo, "Ciudad": mun,
                     "Sucursal": "SIN SUCURSAL CON BATERÍA COMPLETA",
                     "Estudio": est_name,
                     "Costo": round(costo, 2),
@@ -286,10 +348,11 @@ def cotizar_compuesto(studies: List[str],
     rows_detalle: List[Dict] = []
     fallback_rows: List[Dict] = []
 
-    for edo, ciu, pers in ciudades:
-        edo_c, ciu_c = _clean(edo), _clean(ciu)
-        cps = cps_municipio(df_cp, edo_c, ciu_c)
-        df_here = df_suc[df_suc.CP.isin(cps)]
+    for edo, mun, pers in ciudades:
+        edo_c, mun_c = _clean(edo), _clean(mun)
+
+        # ✅ NUEVO: entrada por capas
+        df_here = sucursales_para_municipio(df_suc, df_cp, edo_c, mun_c)
         df_est_req = df_est[df_est.Estudio_norm.isin(est_norm)]
 
         # 0) Sin sucursales → todo fallback (AGREGAR RED)
@@ -298,7 +361,7 @@ def cotizar_compuesto(studies: List[str],
                 estn = _clean(s)
                 if estn not in chopo_map or pd.isna(chopo_map[estn]):
                     fallback_rows.append({
-                        "Estado": edo, "Municipio": ciu,
+                        "Estado": edo, "Municipio": mun,
                         "Laboratorio": LAB_FALLBACK_LABEL,
                         "Sucursal": "SIN SUCURSALES",
                         "Estudio": s,
@@ -311,7 +374,7 @@ def cotizar_compuesto(studies: List[str],
                 precio = round(costo / (1.0 - margin), 2)
 
                 rows_detalle.append({
-                    "Estado": edo, "Municipio": ciu,
+                    "Estado": edo, "Municipio": mun,
                     "Laboratorio": LAB_FALLBACK_LABEL,
                     "Sucursal": "SIN SUCURSALES",
                     "Estudio": s,
@@ -322,7 +385,7 @@ def cotizar_compuesto(studies: List[str],
                     OBS_COL: "Sin sucursales en el municipio",
                 })
                 fallback_rows.append({
-                    "Estado": edo, "Municipio": ciu,
+                    "Estado": edo, "Municipio": mun,
                     "Laboratorio": LAB_FALLBACK_LABEL,
                     "Sucursal": "SIN SUCURSALES",
                     "Estudio": s,
@@ -349,14 +412,13 @@ def cotizar_compuesto(studies: List[str],
                     break
 
         # ✅ Si NO hay batería completa: NO mostramos labs parciales.
-        #    Solo mostramos fallback etiquetado como "AGREGAR RED"
         if not labs_full:
-            obs_txt = _observacion_bateria_incompleta(df_here, df_est_req, est_norm, studies, edo, ciu)
+            obs_txt = _observacion_bateria_incompleta(df_here, df_est_req, est_norm, studies, edo, mun)
             for s in studies:
                 estn = _clean(s)
                 if estn not in chopo_map or pd.isna(chopo_map[estn]):
                     fallback_rows.append({
-                        "Estado": edo, "Municipio": ciu,
+                        "Estado": edo, "Municipio": mun,
                         "Laboratorio": LAB_FALLBACK_LABEL,
                         "Sucursal": "SIN SUCURSAL CON BATERÍA COMPLETA",
                         "Estudio": s,
@@ -369,7 +431,7 @@ def cotizar_compuesto(studies: List[str],
                 precio = round(costo / (1.0 - margin), 2)
 
                 rows_detalle.append({
-                    "Estado": edo, "Municipio": ciu,
+                    "Estado": edo, "Municipio": mun,
                     "Laboratorio": LAB_FALLBACK_LABEL,
                     "Sucursal": "SIN SUCURSAL CON BATERÍA COMPLETA",
                     "Estudio": s,
@@ -380,7 +442,7 @@ def cotizar_compuesto(studies: List[str],
                     OBS_COL: obs_txt,
                 })
                 fallback_rows.append({
-                    "Estado": edo, "Municipio": ciu,
+                    "Estado": edo, "Municipio": mun,
                     "Laboratorio": LAB_FALLBACK_LABEL,
                     "Sucursal": "SIN SUCURSAL CON BATERÍA COMPLETA",
                     "Estudio": s,
@@ -408,15 +470,13 @@ def cotizar_compuesto(studies: List[str],
                         except Exception:
                             costo = None
 
-                # Si por un dato raro faltara costo, permitimos fallback,
-                # pero lo etiquetamos como "AGREGAR RED" (no como el lab original).
                 if costo is None and estn in chopo_map and pd.notna(chopo_map[estn]):
                     costo = float(chopo_map[estn]) * factor_global
                     fallback_flag = True
 
                 if costo is None:
                     fallback_rows.append({
-                        "Estado": edo, "Municipio": ciu,
+                        "Estado": edo, "Municipio": mun,
                         "Laboratorio": lab, "Sucursal": sucursal,
                         "Estudio": s,
                         OBS_COL: "",
@@ -426,7 +486,7 @@ def cotizar_compuesto(studies: List[str],
 
                 precio = round(costo / (1.0 - margin), 2)
                 rows_detalle.append({
-                    "Estado": edo, "Municipio": ciu,
+                    "Estado": edo, "Municipio": mun,
                     "Laboratorio": (LAB_FALLBACK_LABEL if fallback_flag else lab),
                     "Sucursal": sucursal,
                     "Estudio": s,
@@ -439,7 +499,7 @@ def cotizar_compuesto(studies: List[str],
 
                 if fallback_flag:
                     fallback_rows.append({
-                        "Estado": edo, "Municipio": ciu,
+                        "Estado": edo, "Municipio": mun,
                         "Laboratorio": LAB_FALLBACK_LABEL,
                         "Sucursal": sucursal,
                         "Estudio": s,
@@ -449,19 +509,21 @@ def cotizar_compuesto(studies: List[str],
 
     return pd.DataFrame(rows_detalle), pd.DataFrame(fallback_rows)
 
-# ───────── Helper para “Labs recomendados por municipio” (tu lógica del tab) ─────────
+# ───────── Helper para “Labs recomendados por municipio” ─────────
 def recomendar_labs_por_municipio(df_est: pd.DataFrame, df_suc: pd.DataFrame, df_cp: pd.DataFrame,
                                  estudios: List[str], municipios: List[Tuple[str, str]]) -> pd.DataFrame:
     est_norm = {_clean(s) for s in estudios}
     df_est_req = df_est[df_est.Estudio_norm.isin(est_norm)]
 
     rows = []
-    for edo, ciu in municipios:
-        edo_c, ciu_c = _clean(edo), _clean(ciu)
-        cps = cps_municipio(df_cp, edo_c, ciu_c)
-        df_here = df_suc[df_suc.CP.isin(cps)]
+    for edo, mun in municipios:
+        edo_c, mun_c = _clean(edo), _clean(mun)
+
+        # ✅ NUEVO: entrada por capas
+        df_here = sucursales_para_municipio(df_suc, df_cp, edo_c, mun_c)
+
         if df_here.empty:
-            rows.append({"Estado": edo, "Municipio": ciu, "Recomendados": "—", "Nota": "Sin cobertura"})
+            rows.append({"Estado": edo, "Municipio": mun, "Recomendados": "—", "Nota": "Sin cobertura"})
             continue
 
         nota = ""
@@ -480,7 +542,7 @@ def recomendar_labs_por_municipio(df_est: pd.DataFrame, df_suc: pd.DataFrame, df
 
         rows.append({
             "Estado": edo,
-            "Municipio": ciu,
+            "Municipio": mun,
             "Recomendados": "; ".join(recomendados) if recomendados else "— (usar fallback por estudio)",
             "Nota": nota
         })
