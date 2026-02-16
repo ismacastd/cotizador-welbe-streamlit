@@ -28,6 +28,7 @@ LAB_FALLBACK_LABEL = "AGREGAR RED"
 # ✅ Columna amigable para usuario final (solo se llena cuando aplica fallback por batería incompleta)
 OBS_COL = "Observación"
 
+
 # ───────── Utilidades ─────────
 def _clean(txt: str) -> str:
     return (
@@ -47,6 +48,7 @@ def _read_xl(path: Path, sheet: str) -> pd.DataFrame:
         raise FileNotFoundError(f"No existe el archivo: {path}")
     return pd.read_excel(path, sheet_name=sheet)
 
+
 # ───────── Carga de datos ─────────
 def load_estudios() -> pd.DataFrame:
     df = _read_xl(FILE_CHOPO, "Estudios")
@@ -62,10 +64,9 @@ def load_sucursales() -> pd.DataFrame:
     df = _read_xl(FILE_CHOPO, "Sucursales")
     df.columns = df.columns.str.upper().str.strip()
 
-    # Base mínima (la tuya)
     base_cols = ["UNIDAD", "CODIGO POSTAL", "CATEGORIAS", "LABORATORIO"]
 
-    # GEO opcional (solo si existen en el Excel)
+    # GEO opcional (si existe en el Excel)
     geo_cols = []
     for c in ["DELEGACION", "CIUDAD", "ESTADO"]:
         if c in df.columns:
@@ -73,7 +74,6 @@ def load_sucursales() -> pd.DataFrame:
 
     df = df[base_cols + geo_cols].copy()
 
-    # Renombres
     rename_map = {
         "UNIDAD": "Sucursal",
         "CODIGO POSTAL": "CP",
@@ -91,7 +91,6 @@ def load_sucursales() -> pd.DataFrame:
         lambda s: {_clean(c) for c in str(s).split(",") if str(c).strip()}
     )
 
-    # Normaliza GEO si existe
     for c in ["Delegacion", "Ciudad", "Estado"]:
         if c in df.columns:
             df[c] = df[c].apply(_clean)
@@ -99,42 +98,44 @@ def load_sucursales() -> pd.DataFrame:
     return df.dropna(subset=["CP"])
 
 def load_catalogo_cp() -> pd.DataFrame:
+    """
+    Lee catalogo_cp.csv robusto:
+      - CP: d_codigo (principal), o d_cp / c_cp / cp
+      - Estado: d_estado
+      - Municipio: d_mnpio
+    """
     if not FILE_CP.exists():
         raise FileNotFoundError(f"No existe el archivo: {FILE_CP}")
 
     df = pd.read_csv(FILE_CP, dtype=str, encoding="latin1")
     df.columns = df.columns.str.lower().str.strip()
-    cp_col = next(c for c in ("d_codigo", "d_cp", "c_cp", "cp") if c in df.columns)
 
-    # OJO: tu versión original llama "ciudad" a d_mnpio (municipio)
-    df = df[[cp_col, "d_estado", "d_mnpio"]]
-    df.columns = ["CP", "estado", "ciudad"]  # aquí ciudad = municipio (tu naming original)
+    cp_col = None
+    for c in ("d_codigo", "d_cp", "c_cp", "cp"):
+        if c in df.columns:
+            cp_col = c
+            break
+    if not cp_col:
+        raise ValueError(f"No encontré columna de CP. Columnas disponibles: {list(df.columns)}")
+
+    needed = [cp_col, "d_estado", "d_mnpio"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Faltan columnas en catalogo_cp.csv: {missing}. Columnas reales: {list(df.columns)}")
+
+    df = df[[cp_col, "d_estado", "d_mnpio"]].copy()
+    df.columns = ["CP", "estado", "municipio"]
 
     df["CP"] = _fix_cp(df["CP"])
     df["estado"] = df["estado"].apply(_clean)
-    df["ciudad"] = df["ciudad"].apply(_clean)
+    df["municipio"] = df["municipio"].apply(_clean)
 
-    # Si existe d_ciudad en tu CSV, la guardamos como ciudad_real para el match por CIUDAD
-    if "d_ciudad" in df.columns:
-        df["ciudad_real"] = df["d_ciudad"].apply(_clean)
-    else:
-        # Intentamos leerla si venía en el CSV pero no la habías seleccionado
-        try:
-            df_full = pd.read_csv(FILE_CP, dtype=str, encoding="latin1")
-            df_full.columns = df_full.columns.str.lower().str.strip()
-            if "d_ciudad" in df_full.columns:
-                df["ciudad_real"] = df_full["d_ciudad"].apply(_clean)
-            else:
-                df["ciudad_real"] = ""
-        except Exception:
-            df["ciudad_real"] = ""
+    return df.dropna(subset=["CP", "estado", "municipio"])
 
-    return df.dropna(subset=["CP", "ciudad"])
 
 # ───────── Cobertura helpers ─────────
-def cps_municipio(df_cp: pd.DataFrame, edo: str, ciu: str) -> List[str]:
-    # ciu = municipio (por tu naming original)
-    return df_cp.query("estado == @edo and ciudad == @ciu", engine="python")["CP"].tolist()
+def cps_municipio(df_cp: pd.DataFrame, edo: str, muni: str) -> List[str]:
+    return df_cp.query("estado == @edo and municipio == @muni", engine="python")["CP"].tolist()
 
 def _cat_ok_exact(cat: str, cats_series: pd.Series) -> bool:
     return any(cat == c for s in cats_series for c in s)
@@ -177,7 +178,7 @@ def _comb_dos_labs(df_est_req: pd.DataFrame, df_suc_sub: pd.DataFrame, est_norm:
     return ()
 
 def _observacion_bateria_incompleta(df_here: pd.DataFrame, df_est_req: pd.DataFrame, est_norm: set,
-                                   studies_original: List[str], edo: str, ciu: str) -> str:
+                                   studies_original: List[str], edo: str, muni: str) -> str:
     """
     Devuelve un texto amigable para usuario final del tipo:
       "Mastografía no disponible en ningún laboratorio del municipio"
@@ -216,41 +217,36 @@ def _observacion_bateria_incompleta(df_here: pd.DataFrame, df_est_req: pd.DataFr
     return f"{principal} no disponible en ningún laboratorio del municipio"
 
 
-# ───────── NUEVO: Selección de sucursales con Delegación → Ciudad → fallback CP ─────────
-def _sucursales_por_municipio(df_suc: pd.DataFrame, df_cp: pd.DataFrame, edo: str, muni: str) -> Tuple[pd.DataFrame, str]:
+# ───────── Resolver GEO (CP → Delegación → Ciudad) ─────────
+def _sucursales_por_municipio(df_suc: pd.DataFrame, df_cp: pd.DataFrame, edo: str, muni: str) -> tuple[pd.DataFrame, str]:
     """
-    Flujo:
-      1) Si Sucursales trae Estado+Delegacion: filtra por (Estado==edo AND Delegacion==muni)
-      2) Si no hay y trae Estado+Ciudad: intenta match por Ciudad usando catalogo_cp.d_ciudad (ciudad_real)
-      3) Si no hay: fallback original por CP (catalogo_cp por municipio)
+    FLUJO:
+      1) CP (catalogo_cp: estado + municipio -> CPs -> Sucursales por CP)
+      2) Delegación (si existe Estado+Delegacion en Sucursales)
+      3) Ciudad (si existe Estado+Ciudad en Sucursales)
     """
     edo_c = _clean(edo)
     muni_c = _clean(muni)
 
-    # 1) Delegación
-    if {"Estado", "Delegacion"}.issubset(df_suc.columns):
-        df1 = df_suc[(df_suc["Estado"] == edo_c) & (df_suc["Delegacion"] == muni_c)]
-        if not df1.empty:
-            return df1, "delegacion"
-
-    # 2) Ciudad
-    if {"Estado", "Ciudad"}.issubset(df_suc.columns):
-        # ciudades posibles del municipio desde el catálogo
-        ciudades = (
-            df_cp.query("estado == @edo_c and ciudad == @muni_c", engine="python")["ciudad_real"]
-            .dropna().unique().tolist()
-        )
-        ciudades = [c for c in ciudades if str(c).strip()]
-
-        for c in ciudades:
-            c_c = _clean(c)
-            df2 = df_suc[(df_suc["Estado"] == edo_c) & (df_suc["Ciudad"] == c_c)]
-            if not df2.empty:
-                return df2, "ciudad"
-
-    # 3) fallback CP original
+    # 1) CP primero
     cps = cps_municipio(df_cp, edo_c, muni_c)
-    return df_suc[df_suc.CP.isin(cps)], "cp_fallback"
+    df_cp_match = df_suc[df_suc.CP.isin(cps)]
+    if not df_cp_match.empty:
+        return df_cp_match, "cp"
+
+    # 2) Delegación
+    if {"Estado", "Delegacion"}.issubset(df_suc.columns):
+        df_del = df_suc[(df_suc["Estado"] == edo_c) & (df_suc["Delegacion"] == muni_c)]
+        if not df_del.empty:
+            return df_del, "delegacion"
+
+    # 3) Ciudad
+    if {"Estado", "Ciudad"}.issubset(df_suc.columns):
+        df_ciu = df_suc[(df_suc["Estado"] == edo_c) & (df_suc["Ciudad"] == muni_c)]
+        if not df_ciu.empty:
+            return df_ciu, "ciudad"
+
+    return df_suc.iloc[0:0], "sin_match"
 
 
 # ───────── COTIZACIÓN SENCILLA (Candidatos) ─────────
@@ -273,7 +269,6 @@ def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
     filas: List[Dict] = []
 
     for edo, muni in sel_ciu:
-        # ✅ NUEVO: Delegación → Ciudad → CP fallback
         df_here, modo_geo = _sucursales_por_municipio(df_suc, df_cp, edo, muni)
 
         # Caso 1: sin sucursales → fallback directo CHOPO × 1.8
@@ -384,7 +379,6 @@ def cotizar_compuesto(studies: List[str], ciudades: List[Tuple[str, str, int]],
     fallback_rows: List[Dict] = []
 
     for edo, muni, pers in ciudades:
-        # ✅ NUEVO: Delegación → Ciudad → CP fallback
         df_here, modo_geo = _sucursales_por_municipio(df_suc, df_cp, edo, muni)
         df_est_req = df_est[df_est.Estudio_norm.isin(est_norm)]
 
@@ -435,7 +429,7 @@ def cotizar_compuesto(studies: List[str], ciudades: List[Tuple[str, str, int]],
                     labs_full.append((lab, suc_row.Sucursal))
                     break
 
-        # ✅ Si NO hay batería completa: NO mostramos labs parciales → fallback
+        # ✅ Si NO hay batería completa: fallback
         if not labs_full:
             obs_txt = _observacion_bateria_incompleta(df_here, df_est_req, est_norm, studies, edo, muni)
             for s in studies:
