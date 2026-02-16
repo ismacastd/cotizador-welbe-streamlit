@@ -30,6 +30,20 @@ except Exception as e:
     st.error(f"Error cargando archivos en /assets:\n\n{e}")
     st.stop()
 
+# ───────── Normalizar columnas esperadas en df_cp ─────────
+# Queremos trabajar con: estado + municipio (pero si tu core trae ciudad, también funciona)
+df_cp.columns = df_cp.columns.str.lower().str.strip()
+
+if "estado" not in df_cp.columns:
+    st.error(f"catalogo_cp no trae columna 'estado'. Columnas: {list(df_cp.columns)}")
+    st.stop()
+
+# Columna geo: preferimos "municipio", si no existe usamos "ciudad"
+geo_col = "municipio" if "municipio" in df_cp.columns else ("ciudad" if "ciudad" in df_cp.columns else None)
+if not geo_col:
+    st.error(f"catalogo_cp no trae columna 'municipio' ni 'ciudad'. Columnas: {list(df_cp.columns)}")
+    st.stop()
+
 # ───────── Sidebar ─────────
 st.sidebar.header("Parámetros")
 
@@ -48,15 +62,18 @@ st.sidebar.divider()
 estudios = sorted(df_est["Estudio"].dropna().unique().tolist())
 sel_est = st.sidebar.multiselect("Estudios", options=estudios)
 
-# ───────── Selección de municipios (Estado + Ciudad) ─────────
+# ───────── Selección de municipios (Estado + Municipio) ─────────
 estados = sorted(df_cp["estado"].dropna().unique().tolist())
 sel_estado = st.sidebar.selectbox("Estado", options=[""] + estados)
 
-ciudades = []
+municipios_opts = []
 if sel_estado:
-    ciudades = sorted(df_cp[df_cp["estado"] == sel_estado]["ciudad"].dropna().unique().tolist())
+    municipios_opts = sorted(
+        df_cp[df_cp["estado"] == sel_estado][geo_col].dropna().unique().tolist()
+    )
 
-sel_ciudad = st.sidebar.selectbox("Ciudad/Municipio", options=[""] + ciudades)
+# Mantenemos tu UI “Ciudad/Municipio”, pero ahora es realmente municipio.
+sel_ciudad = st.sidebar.selectbox("Ciudad/Municipio", options=[""] + municipios_opts)
 
 if "municipios" not in st.session_state:
     st.session_state["municipios"] = []  # lista de dicts
@@ -64,7 +81,6 @@ if "municipios" not in st.session_state:
 col_add1, col_add2 = st.sidebar.columns([1, 1])
 if col_add1.button("Agregar municipio"):
     if sel_estado and sel_ciudad:
-        # Evitar duplicados
         actuales = st.session_state["municipios"]
         if not any(m["Estado"] == sel_estado and m["Municipio"] == sel_ciudad for m in actuales):
             actuales.append({"Estado": sel_estado, "Municipio": sel_ciudad, "Personas": 0})
@@ -113,6 +129,8 @@ if st.button("CALCULAR", type="primary"):
     municipios_comp = [(r["Estado"], r["Municipio"], int(r.get("Personas", 0) or 0)) for _, r in mun_df.iterrows()]
 
     with st.spinner("Calculando Periódicos..."):
+        # Nota: tu core actual espera ciudades=... (nombre del arg),
+        # pero el contenido es (Estado, Municipio, Personas) como siempre.
         df_det, df_fb = cotizar_compuesto(
             studies=sel_est,
             ciudades=municipios_comp,

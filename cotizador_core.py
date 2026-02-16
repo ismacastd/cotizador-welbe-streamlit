@@ -1,14 +1,13 @@
 # cotizador_core.py – Welbe v3.1 (core para Streamlit)
-# Basado en tu cotizador_welbe.py (misma lógica, sin Tkinter)
-
 from __future__ import annotations
+
 import itertools
 import unicodedata
 from pathlib import Path
 from typing import List, Tuple, Dict
 import pandas as pd
 
-# ───────── Paths (compatibles con local y deploy) ─────────
+# ───────── Paths ─────────
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 FILE_CHOPO = ASSETS_DIR / "Para Cotizar con base a Chopo.xlsx"
@@ -20,12 +19,9 @@ FACTOR_FB_VOL = 2.00
 FACTOR_FB_NOVOL = 2.20
 
 MAIN_LAB = "CHOPO"
-FACTOR_ZONA2 = 1.8  # Candidatos fallback: CHOPO × 1.8
+FACTOR_ZONA2 = 1.8  # fallback (base CHOPO × 1.8)
 
-# ✅ Etiqueta visible cuando el precio viene por fallback (base CHOPO × factor)
 LAB_FALLBACK_LABEL = "AGREGAR RED"
-
-# ✅ Columna amigable para usuario final (solo se llena cuando aplica fallback por batería incompleta)
 OBS_COL = "Observación"
 
 
@@ -39,8 +35,10 @@ def _clean(txt: str) -> str:
 
 def _fix_cp(s: pd.Series) -> pd.Series:
     return (
-        s.astype(str).str.replace(r"\.0$", "", regex=True)
-        .str.strip().str.zfill(5)
+        s.astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.strip()
+        .str.zfill(5)
     )
 
 def _read_xl(path: Path, sheet: str) -> pd.DataFrame:
@@ -53,11 +51,14 @@ def _read_xl(path: Path, sheet: str) -> pd.DataFrame:
 def load_estudios() -> pd.DataFrame:
     df = _read_xl(FILE_CHOPO, "Estudios")
     df.columns = df.columns.str.upper().str.strip()
+
     df = df[["LABORATORIO", "NOMBRE AJUSTADO", "CATEGORIA LAB", "COSTO WELBE (SIN IVA)"]]
     df.columns = ["Laboratorio", "Estudio", "Categoria_lab", "Costo"]
+
     df["Laboratorio"] = df["Laboratorio"].apply(_clean)
     df["Estudio_norm"] = df["Estudio"].apply(_clean)
     df["Categoria_lab"] = df["Categoria_lab"].apply(_clean)
+
     return df.dropna(subset=["Estudio"])
 
 def load_sucursales() -> pd.DataFrame:
@@ -65,12 +66,7 @@ def load_sucursales() -> pd.DataFrame:
     df.columns = df.columns.str.upper().str.strip()
 
     base_cols = ["UNIDAD", "CODIGO POSTAL", "CATEGORIAS", "LABORATORIO"]
-
-    # GEO opcional (si existe en el Excel)
-    geo_cols = []
-    for c in ["DELEGACION", "CIUDAD", "ESTADO"]:
-        if c in df.columns:
-            geo_cols.append(c)
+    geo_cols = [c for c in ["DELEGACION", "CIUDAD", "ESTADO"] if c in df.columns]
 
     df = df[base_cols + geo_cols].copy()
 
@@ -87,6 +83,7 @@ def load_sucursales() -> pd.DataFrame:
 
     df["CP"] = _fix_cp(df["CP"])
     df["Laboratorio"] = df["Laboratorio"].apply(_clean)
+
     df["Cats_set"] = df["Categorias"].fillna("").apply(
         lambda s: {_clean(c) for c in str(s).split(",") if str(c).strip()}
     )
@@ -99,8 +96,8 @@ def load_sucursales() -> pd.DataFrame:
 
 def load_catalogo_cp() -> pd.DataFrame:
     """
-    Lee catalogo_cp.csv robusto:
-      - CP: d_codigo (principal), o d_cp / c_cp / cp
+    catalogo_cp.csv (según tu estructura):
+      - CP: d_codigo   ✅
       - Estado: d_estado
       - Municipio: d_mnpio
     """
@@ -110,6 +107,7 @@ def load_catalogo_cp() -> pd.DataFrame:
     df = pd.read_csv(FILE_CP, dtype=str, encoding="latin1")
     df.columns = df.columns.str.lower().str.strip()
 
+    # CP real es d_codigo, pero lo dejamos robusto por si cambia
     cp_col = None
     for c in ("d_codigo", "d_cp", "c_cp", "cp"):
         if c in df.columns:
@@ -129,6 +127,9 @@ def load_catalogo_cp() -> pd.DataFrame:
     df["CP"] = _fix_cp(df["CP"])
     df["estado"] = df["estado"].apply(_clean)
     df["municipio"] = df["municipio"].apply(_clean)
+
+    # ✅ Compatibilidad: por si tu app vieja pedía df_cp["ciudad"]
+    df["ciudad"] = df["municipio"]
 
     return df.dropna(subset=["CP", "estado", "municipio"])
 
@@ -159,19 +160,21 @@ def _comb_dos_labs(df_est_req: pd.DataFrame, df_suc_sub: pd.DataFrame, est_norm:
             r1 = df_est_req[(df_est_req.Estudio_norm == estn) & (df_est_req.Laboratorio == lab1)]
             r2 = df_est_req[(df_est_req.Estudio_norm == estn) & (df_est_req.Laboratorio == lab2)]
             if r1.empty and r2.empty:
-                ok = False; break
+                ok = False
+                break
 
-            lab1_ok = (
-                (not r1.empty) and
-                _cat_ok_exact(r1.Categoria_lab.iloc[0], df_suc_sub[df_suc_sub.Laboratorio == lab1]["Cats_set"])
+            lab1_ok = (not r1.empty) and _cat_ok_exact(
+                r1.Categoria_lab.iloc[0],
+                df_suc_sub[df_suc_sub.Laboratorio == lab1]["Cats_set"]
             )
-            lab2_ok = (
-                (not r2.empty) and
-                _cat_ok_exact(r2.Categoria_lab.iloc[0], df_suc_sub[df_suc_sub.Laboratorio == lab2]["Cats_set"])
+            lab2_ok = (not r2.empty) and _cat_ok_exact(
+                r2.Categoria_lab.iloc[0],
+                df_suc_sub[df_suc_sub.Laboratorio == lab2]["Cats_set"]
             )
 
             if not (lab1_ok or lab2_ok):
-                ok = False; break
+                ok = False
+                break
 
         if ok:
             return lab1, lab2
@@ -179,16 +182,11 @@ def _comb_dos_labs(df_est_req: pd.DataFrame, df_suc_sub: pd.DataFrame, est_norm:
 
 def _observacion_bateria_incompleta(df_here: pd.DataFrame, df_est_req: pd.DataFrame, est_norm: set,
                                    studies_original: List[str], edo: str, muni: str) -> str:
-    """
-    Devuelve un texto amigable para usuario final del tipo:
-      "Mastografía no disponible en ningún laboratorio del municipio"
-    """
     labs = sorted(df_here["Laboratorio"].unique().tolist())
     if not labs:
         return "Sin cobertura en el municipio"
 
     faltantes_globales: List[str] = []
-
     for est_name in studies_original:
         estn = _clean(est_name)
         disponible_en_alguno = False
@@ -213,18 +211,11 @@ def _observacion_bateria_incompleta(df_here: pd.DataFrame, df_est_req: pd.DataFr
     if not faltantes_globales:
         return "No hay laboratorio con batería completa en el municipio"
 
-    principal = faltantes_globales[0]
-    return f"{principal} no disponible en ningún laboratorio del municipio"
+    return f"{faltantes_globales[0]} no disponible en ningún laboratorio del municipio"
 
 
-# ───────── Resolver GEO (CP → Delegación → Ciudad) ─────────
+# ───────── Resolver GEO: CP → Delegación → Ciudad ─────────
 def _sucursales_por_municipio(df_suc: pd.DataFrame, df_cp: pd.DataFrame, edo: str, muni: str) -> tuple[pd.DataFrame, str]:
-    """
-    FLUJO:
-      1) CP (catalogo_cp: estado + municipio -> CPs -> Sucursales por CP)
-      2) Delegación (si existe Estado+Delegacion en Sucursales)
-      3) Ciudad (si existe Estado+Ciudad en Sucursales)
-    """
     edo_c = _clean(edo)
     muni_c = _clean(muni)
 
@@ -249,12 +240,12 @@ def _sucursales_por_municipio(df_suc: pd.DataFrame, df_cp: pd.DataFrame, edo: st
     return df_suc.iloc[0:0], "sin_match"
 
 
-# ───────── COTIZACIÓN SENCILLA (Candidatos) ─────────
-def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
+# ───────── COTIZACIÓN SENCILLA ─────────
+def armar_sencilla(sel_est: List[str], sel_muni: List[Tuple[str, str]],
                    df_est: pd.DataFrame, df_suc: pd.DataFrame, df_cp: pd.DataFrame,
                    margin: float = MARGIN_DEF):
 
-    if not sel_est or not sel_ciu:
+    if not sel_est or not sel_muni:
         raise ValueError("Seleccione al menos un estudio y un municipio.")
     if margin >= 1:
         raise ValueError("El margen debe ser menor a 100%.")
@@ -262,16 +253,14 @@ def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
     est_norm = {_clean(s) for s in sel_est}
     df_est_req = df_est[df_est.Estudio_norm.isin(est_norm)]
 
-    chopo_map = dict(
-        df_est[df_est.Laboratorio == MAIN_LAB][["Estudio_norm", "Costo"]].values
-    )
+    chopo_map = dict(df_est[df_est.Laboratorio == MAIN_LAB][["Estudio_norm", "Costo"]].values)
 
     filas: List[Dict] = []
 
-    for edo, muni in sel_ciu:
+    for edo, muni in sel_muni:
         df_here, modo_geo = _sucursales_por_municipio(df_suc, df_cp, edo, muni)
 
-        # Caso 1: sin sucursales → fallback directo CHOPO × 1.8
+        # Sin sucursales → fallback
         if df_here.empty:
             for est_name in sel_est:
                 estn = _clean(est_name)
@@ -292,9 +281,8 @@ def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
                 })
             continue
 
-        # Caso 2: buscar sucursales que cubran TODA la batería por lab
-        labs_full: List[Tuple[str, str]] = []  # (lab, sucursal)
-
+        # Buscar batería completa por lab+sucursal
+        labs_full: List[Tuple[str, str]] = []
         for lab in sorted(df_here.Laboratorio.unique()):
             df_lab_suc = df_here[df_here.Laboratorio == lab]
             for _, suc_row in df_lab_suc.iterrows():
@@ -303,14 +291,15 @@ def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
                 for estn in est_norm:
                     r = df_est_req[(df_est_req.Laboratorio == lab) & (df_est_req.Estudio_norm == estn)]
                     if r.empty:
-                        ok = False; break
+                        ok = False
+                        break
                     if r.Categoria_lab.iloc[0] not in cats:
-                        ok = False; break
+                        ok = False
+                        break
                 if ok:
                     labs_full.append((lab, suc_row.Sucursal))
                     break
 
-        # 2.a hay batería completa → listamos
         if labs_full:
             for lab, sucursal in labs_full:
                 for est_name in sel_est:
@@ -331,8 +320,6 @@ def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
                         "Laboratorio": lab,
                         "Zona": "DIRECTO",
                     })
-
-        # 2.b no hay batería completa → fallback candidatos (CHOPO × 1.8)
         else:
             obs_txt = _observacion_bateria_incompleta(df_here, df_est_req, est_norm, sel_est, edo, muni)
             for est_name in sel_est:
@@ -357,32 +344,33 @@ def armar_sencilla(sel_est: List[str], sel_ciu: List[Tuple[str, str]],
     return pd.DataFrame(filas), {}
 
 
-# ───────── COTIZACIÓN COMPUESTA (Periódicos) ─────────
-def cotizar_compuesto(studies: List[str], ciudades: List[Tuple[str, str, int]],
+# ───────── COTIZACIÓN COMPUESTA ─────────
+def cotizar_compuesto(studies: List[str], municipios: List[Tuple[str, str, int]],
                       df_est: pd.DataFrame, df_suc: pd.DataFrame, df_cp: pd.DataFrame,
                       margin: float = MARGIN_DEF, factor_fb: float = FACTOR_FB_VOL):
 
     if margin >= 1:
         raise ValueError("El margen debe ser menor a 100%.")
 
-    has_vol = any((pers or 0) > 0 for _, _, pers in ciudades)
-    has_no_vol = any((pers or 0) == 0 for _, _, pers in ciudades)
+    has_vol = any((pers or 0) > 0 for _, _, pers in municipios)
+    has_no_vol = any((pers or 0) == 0 for _, _, pers in municipios)
+
     if has_vol and has_no_vol:
         factor_global = FACTOR_FB_NOVOL
     else:
         factor_global = FACTOR_FB_VOL if has_vol else FACTOR_FB_NOVOL
 
     est_norm = {_clean(s) for s in studies}
+    df_est_req_all = df_est[df_est.Estudio_norm.isin(est_norm)]
     chopo_map = dict(df_est[df_est.Laboratorio == MAIN_LAB][["Estudio_norm", "Costo"]].values)
 
     rows_detalle: List[Dict] = []
     fallback_rows: List[Dict] = []
 
-    for edo, muni, pers in ciudades:
+    for edo, muni, pers in municipios:
         df_here, modo_geo = _sucursales_por_municipio(df_suc, df_cp, edo, muni)
-        df_est_req = df_est[df_est.Estudio_norm.isin(est_norm)]
 
-        # 0) Sin sucursales → todo fallback (AGREGAR RED)
+        # Sin sucursales → fallback total
         if df_here.empty:
             for s in studies:
                 estn = _clean(s)
@@ -400,19 +388,13 @@ def cotizar_compuesto(studies: List[str], ciudades: List[Tuple[str, str, int]],
                 rows_detalle.append({
                     "Estado": edo, "Municipio": muni, "ModoGeo": modo_geo,
                     "Laboratorio": LAB_FALLBACK_LABEL, "Sucursal": "SIN SUCURSALES",
-                    "Estudio": s, "Costo_lab": round(costo, 2),
-                    "Precio_lab": precio, "Margen": margin, "Fallback": True,
+                    "Estudio": s, "Costo_lab": round(costo, 2), "Precio_lab": precio,
+                    "Margen": margin, "Fallback": True, "Personas": pers,
                     OBS_COL: "Sin sucursales en el municipio",
-                })
-                fallback_rows.append({
-                    "Estado": edo, "Municipio": muni, "ModoGeo": modo_geo,
-                    "Laboratorio": LAB_FALLBACK_LABEL, "Sucursal": "SIN SUCURSALES",
-                    "Estudio": s, OBS_COL: "Sin sucursales en el municipio",
-                    "Motivo": "Sin sucursales en municipio"
                 })
             continue
 
-        # 1) labs que cubran batería completa (por lab + sucursal)
+        # labs con batería completa
         labs_full: List[Tuple[str, str]] = []
         for lab in sorted(df_here.Laboratorio.unique()):
             df_lab_suc = df_here[df_here.Laboratorio == lab]
@@ -420,18 +402,16 @@ def cotizar_compuesto(studies: List[str], ciudades: List[Tuple[str, str, int]],
                 cats = suc_row.Cats_set
                 ok = True
                 for estn in est_norm:
-                    r = df_est_req[(df_est_req.Laboratorio == lab) & (df_est_req.Estudio_norm == estn)]
-                    if r.empty:
-                        ok = False; break
-                    if r.Categoria_lab.iloc[0] not in cats:
-                        ok = False; break
+                    r = df_est_req_all[(df_est_req_all.Laboratorio == lab) & (df_est_req_all.Estudio_norm == estn)]
+                    if r.empty or (r.Categoria_lab.iloc[0] not in cats):
+                        ok = False
+                        break
                 if ok:
                     labs_full.append((lab, suc_row.Sucursal))
                     break
 
-        # ✅ Si NO hay batería completa: fallback
         if not labs_full:
-            obs_txt = _observacion_bateria_incompleta(df_here, df_est_req, est_norm, studies, edo, muni)
+            obs_txt = _observacion_bateria_incompleta(df_here, df_est_req_all, est_norm, studies, edo, muni)
             for s in studies:
                 estn = _clean(s)
                 if estn not in chopo_map or pd.isna(chopo_map[estn]):
@@ -447,19 +427,13 @@ def cotizar_compuesto(studies: List[str], ciudades: List[Tuple[str, str, int]],
                 rows_detalle.append({
                     "Estado": edo, "Municipio": muni, "ModoGeo": modo_geo,
                     "Laboratorio": LAB_FALLBACK_LABEL, "Sucursal": "SIN SUCURSAL CON BATERÍA COMPLETA",
-                    "Estudio": s, "Costo_lab": round(costo, 2),
-                    "Precio_lab": precio, "Margen": margin, "Fallback": True,
+                    "Estudio": s, "Costo_lab": round(costo, 2), "Precio_lab": precio,
+                    "Margen": margin, "Fallback": True, "Personas": pers,
                     OBS_COL: obs_txt,
-                })
-                fallback_rows.append({
-                    "Estado": edo, "Municipio": muni, "ModoGeo": modo_geo,
-                    "Laboratorio": LAB_FALLBACK_LABEL, "Sucursal": "SIN SUCURSAL CON BATERÍA COMPLETA",
-                    "Estudio": s, OBS_COL: obs_txt,
-                    "Motivo": "Ningún laboratorio cubre batería completa → fallback"
                 })
             continue
 
-        # 2) cotizar SOLO labs con batería completa
+        # cotizar labs completos
         for lab, sucursal in labs_full:
             df_suc_lab_suc = df_here[(df_here.Laboratorio == lab) & (df_here.Sucursal == sucursal)]
             suc_cats = df_suc_lab_suc["Cats_set"].iloc[0] if not df_suc_lab_suc.empty else set()
@@ -469,16 +443,13 @@ def cotizar_compuesto(studies: List[str], ciudades: List[Tuple[str, str, int]],
                 costo = None
                 fallback_flag = False
 
-                r = df_est_req[(df_est_req.Laboratorio == lab) & (df_est_req.Estudio_norm == estn)]
-                if not r.empty:
-                    cat = r.Categoria_lab.iloc[0]
-                    if cat in suc_cats:
-                        try:
-                            costo = float(r.Costo.iloc[0])
-                        except Exception:
-                            costo = None
+                r = df_est_req_all[(df_est_req_all.Laboratorio == lab) & (df_est_req_all.Estudio_norm == estn)]
+                if not r.empty and r.Categoria_lab.iloc[0] in suc_cats:
+                    try:
+                        costo = float(r.Costo.iloc[0])
+                    except Exception:
+                        costo = None
 
-                # fallback por costo raro
                 if costo is None and estn in chopo_map and pd.notna(chopo_map[estn]):
                     costo = float(chopo_map[estn]) * factor_global
                     fallback_flag = True
@@ -501,23 +472,14 @@ def cotizar_compuesto(studies: List[str], ciudades: List[Tuple[str, str, int]],
                     "Precio_lab": precio,
                     "Margen": margin,
                     "Fallback": fallback_flag,
+                    "Personas": pers,
                     OBS_COL: (f"{s} cotizado por fallback" if fallback_flag else ""),
                 })
-
-                if fallback_flag:
-                    fallback_rows.append({
-                        "Estado": edo, "Municipio": muni, "ModoGeo": modo_geo,
-                        "Laboratorio": LAB_FALLBACK_LABEL,
-                        "Sucursal": sucursal,
-                        "Estudio": s,
-                        OBS_COL: f"{s} cotizado por fallback",
-                        "Motivo": "Fallback (base CHOPO × factor)"
-                    })
 
     return pd.DataFrame(rows_detalle), pd.DataFrame(fallback_rows)
 
 
-# ───────── Helper para “Labs recomendados por municipio” (tu lógica del tab) ─────────
+# ───────── Helper: Labs recomendados ─────────
 def recomendar_labs_por_municipio(df_est: pd.DataFrame, df_suc: pd.DataFrame, df_cp: pd.DataFrame,
                                   estudios: List[str], municipios: List[Tuple[str, str]]) -> pd.DataFrame:
     est_norm = {_clean(s) for s in estudios}
@@ -556,7 +518,7 @@ def recomendar_labs_por_municipio(df_est: pd.DataFrame, df_suc: pd.DataFrame, df
     return pd.DataFrame(rows)
 
 
-# ───────── Loader maestro (para cache en Streamlit) ─────────
+# ───────── Loader maestro ─────────
 def cargar_todo() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df_est = load_estudios()
     df_suc = load_sucursales()
